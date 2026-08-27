@@ -1,2 +1,7 @@
 node_modules
 .env
+
+# conversation logs + dumped prompt — keep these private, never commit
+chat-log.txt
+chat-log.jsonl
+system-prompt.txt

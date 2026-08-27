@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { AzureOpenAI } from "openai";
 import {
@@ -104,6 +105,37 @@ The difference you should feel:
 
 Be respectful, lovely, and genuinely helpful. Always "aap". Go.`;
 
+// --- Local conversation logging -------------------------------------------
+// Every prompt + reply is appended to chat-log.txt (human readable) and
+// chat-log.jsonl (machine readable) next to this file. The full system prompt
+// is written to system-prompt.txt on startup so you can read the live persona.
+// NOTE: on Render the disk is ephemeral, so these are for LOCAL runs.
+const LOG_TXT = path.join(__dirname, "chat-log.txt");
+const LOG_JSONL = path.join(__dirname, "chat-log.jsonl");
+const PROMPT_FILE = path.join(__dirname, "system-prompt.txt");
+
+function stamp() {
+  return new Date().toLocaleString("en-IN", { hour12: false });
+}
+
+function logTurn(userMsg, aiReply) {
+  try {
+    const block =
+      `\n${"=".repeat(70)}\n` +
+      `[${stamp()}]\n\n` +
+      `USER:\n${userMsg}\n\n` +
+      `AI:\n${aiReply}\n`;
+    fs.appendFileSync(LOG_TXT, block, "utf8");
+    fs.appendFileSync(
+      LOG_JSONL,
+      JSON.stringify({ time: new Date().toISOString(), user: userMsg, ai: aiReply }) + "\n",
+      "utf8"
+    );
+  } catch (e) {
+    console.error("log write failed:", e.message);
+  }
+}
+
 // --- Safety net: auto-correct the repeat-offender "tumi"/"tui" words to "apni"
 // forms. Only whole-word (\b) matches, and only complete buffered words (see
 // below), so it never mangles a correct word mid-stream.
@@ -181,23 +213,31 @@ app.post("/api/chat", async (req, res) => {
 
     // Buffer partial words so fixApni only ever sees COMPLETE words.
     let pending = "";
+    let fullReply = "";
     for await (const chunk of stream) {
       const delta = chunk?.choices?.[0]?.delta?.content;
       if (!delta) continue;
       pending += delta;
       const lastWs = Math.max(pending.lastIndexOf(" "), pending.lastIndexOf("\n"));
       if (lastWs >= 0) {
-        const ready = pending.slice(0, lastWs + 1);
+        const ready = fixApni(pending.slice(0, lastWs + 1));
         pending = pending.slice(lastWs + 1);
-        res.write(`data: ${JSON.stringify({ delta: fixApni(ready) })}\n\n`);
+        fullReply += ready;
+        res.write(`data: ${JSON.stringify({ delta: ready })}\n\n`);
       }
     }
     if (pending) {
-      res.write(`data: ${JSON.stringify({ delta: fixApni(pending) })}\n\n`);
+      const ready = fixApni(pending);
+      fullReply += ready;
+      res.write(`data: ${JSON.stringify({ delta: ready })}\n\n`);
     }
 
     res.write("data: [DONE]\n\n");
     res.end();
+
+    // Record this turn locally.
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    logTurn(lastUser?.content ?? "(no user message)", fullReply.trim());
   } catch (err) {
     console.error("Chat error:", err?.message || err);
     res.write(
@@ -212,6 +252,14 @@ app.post("/api/chat", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n😏 Iffat backend live on http://localhost:${PORT}`);
-  console.log(`   Deployment: ${AZURE_OPENAI_CHATGPT_DEPLOYMENT}\n`);
+  // Dump the live system prompt so you can read the current persona.
+  try {
+    fs.writeFileSync(PROMPT_FILE, SYSTEM_PROMPT, "utf8");
+  } catch (e) {
+    console.error("could not write system-prompt.txt:", e.message);
+  }
+  console.log(`\n🌸 Iffat backend live on http://localhost:${PORT}`);
+  console.log(`   Deployment: ${AZURE_OPENAI_CHATGPT_DEPLOYMENT}`);
+  console.log(`   System prompt -> ${PROMPT_FILE}`);
+  console.log(`   Chat log      -> ${LOG_TXT}\n`);
 });
