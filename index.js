@@ -127,9 +127,15 @@ const SUMMARIZE_ADDENDUM = `
 ## SUMMARIZING VIDEOS AND WEBPAGES
 You can genuinely read YouTube videos (via their captions) and webpages (via their article text) using the summarize_link tool. Whenever Iffat shares a YouTube link or any web URL and asks for a summary, or asks what it's about, call summarize_link with that URL first — never guess from the link alone or from memory. Once it returns, give her a clear, genuinely useful summary in your own warm voice — a few key points usually beats one giant paragraph. If it comes back with an error (no captions available, page couldn't be read), tell her honestly and suggest she paste the key parts instead.`;
 
+const PHOTO_ADDENDUM = `
+
+## PHOTOS
+Iffat can send you photos, and you genuinely see them. React like a person would, not like an image classifier — no "the image shows a..." narration. Notice the one thing that matters and say something warm and specific about it. If it's a selfie, be sweet without being creepy. If it's homework, a screenshot, a form, or something she needs help with, actually read it and help. If it's food, react to the food. If you truly can't make something out, say so plainly and ask her about it instead of guessing.`;
+
 const SYSTEM_PROMPT =
   BASE_SYSTEM_PROMPT +
   SUMMARIZE_ADDENDUM +
+  PHOTO_ADDENDUM +
   (YOUTUBE_API_KEY ? SONG_ADDENDUM : "");
 
 // --- find_song tool: real YouTube search, not model memory ---------------
@@ -313,6 +319,21 @@ function stamp() {
   return new Date().toLocaleString("en-IN", { hour12: false });
 }
 
+// A message with a photo has array content; keep the log readable (and
+// small) by writing the text parts and a marker instead of base64 blobs.
+function flattenForLog(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "(no user message)";
+  return (
+    content
+      .map((part) =>
+        part?.type === "text" ? part.text : part?.type === "image_url" ? "[photo]" : ""
+      )
+      .filter(Boolean)
+      .join(" ") || "[photo]"
+  );
+}
+
 function logTurn(userMsg, aiReply) {
   try {
     const block =
@@ -369,10 +390,19 @@ const corsOrigin = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim())
   : true;
 app.use(cors({ origin: corsOrigin }));
-app.use(express.json({ limit: "1mb" }));
+// Photos arrive inline as base64 data URIs, so this needs headroom. The
+// client already downscales to ~1024px before sending, which keeps a
+// typical photo well under 1 MB — this is just the safety margin.
+app.use(express.json({ limit: "12mb" }));
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, deployment: AZURE_OPENAI_CHATGPT_DEPLOYMENT });
+  // `tts` lets the frontend hide the voice-note players entirely when no
+  // Sarvam key is configured, rather than showing dead play buttons.
+  res.json({
+    ok: true,
+    deployment: AZURE_OPENAI_CHATGPT_DEPLOYMENT,
+    tts: Boolean(SARVAM_API_KEY),
+  });
 });
 
 // --- Sarvam AI text-to-speech ---------------------------------------------
@@ -451,10 +481,18 @@ app.post("/api/chat", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
+  // A message's content is normally a plain string, but when Iffat sends a
+  // photo it's an array of parts — {type:"text"} plus {type:"image_url"}
+  // with a base64 data URI — which is what gpt-4o's vision expects.
   const conversation = [
     { role: "system", content: SYSTEM_PROMPT },
     ...messages
-      .filter((m) => m && m.role && typeof m.content === "string")
+      .filter(
+        (m) =>
+          m &&
+          m.role &&
+          (typeof m.content === "string" || Array.isArray(m.content))
+      )
       .map((m) => ({ role: m.role, content: m.content })),
   ];
   const tools = [
@@ -627,7 +665,7 @@ app.post("/api/chat", async (req, res) => {
 
     // Record this turn locally.
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
-    logTurn(lastUser?.content ?? "(no user message)", fullReply.trim());
+    logTurn(flattenForLog(lastUser?.content), fullReply.trim());
   } catch (err) {
     console.error("Chat error:", err?.message || err);
     res.write(
