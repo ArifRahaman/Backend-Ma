@@ -125,7 +125,11 @@ You can genuinely search YouTube using the find_song tool. Whenever Iffat asks y
 const SUMMARIZE_ADDENDUM = `
 
 ## SUMMARIZING VIDEOS AND WEBPAGES
-You can genuinely read YouTube videos (via their captions) and webpages (via their article text) using the summarize_link tool. Whenever Iffat shares a YouTube link or any web URL and asks for a summary, or asks what it's about, call summarize_link with that URL first — never guess from the link alone or from memory. Once it returns, give her a clear, genuinely useful summary in your own warm voice — a few key points usually beats one giant paragraph. If it comes back with an error (no captions available, page couldn't be read), tell her honestly and suggest she paste the key parts instead.`;
+You can genuinely read YouTube videos (via their captions) and webpages (via their article text) using the summarize_link tool. Whenever Iffat shares a YouTube link or any web URL and asks for a summary, or asks what it's about, call summarize_link with that URL first — never guess from the link alone or from memory. Once it returns, give her a clear, genuinely useful summary in your own warm voice — a few key points usually beats one giant paragraph.
+
+Check the "source" field before you answer. If it's "captions", you actually watched the whole thing — summarize freely. If it's "description", the captions couldn't be fetched and all you have is what the uploader wrote in the description box, so summarize that and say plainly up front that you're going by the video's description rather than the video itself, and offer to go deeper if she pastes anything specific. Never pass a description off as if you'd seen the video.
+
+If it comes back with an error, tell her honestly and suggest she paste the key parts instead — but don't claim the video "has no captions" unless the error actually says so, since the fetch can also just fail.`;
 
 const PHOTO_ADDENDUM = `
 
@@ -253,26 +257,85 @@ async function fetchYouTubeOEmbed(videoId) {
   }
 }
 
+// Captions come from youtube-transcript-plus, which fetches youtube.com as
+// if it were a browser. That works fine from a home IP but YouTube bot-blocks
+// cloud datacenter ranges (Render, Vercel, AWS...), so in production this
+// often fails even for videos that plainly have captions. When it does, fall
+// back to the video's own description via the YouTube Data API — that's an
+// authenticated API, so it isn't IP-blocked. Weaker than a transcript, but
+// far better than telling Iffat the video has no captions.
+async function fetchVideoDetails(videoId) {
+  if (!YOUTUBE_API_KEY) return null;
+  try {
+    const url = new URL("https://www.googleapis.com/youtube/v3/videos");
+    url.searchParams.set("part", "snippet");
+    url.searchParams.set("id", videoId);
+    url.searchParams.set("key", YOUTUBE_API_KEY);
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const sn = (await res.json())?.items?.[0]?.snippet;
+    if (!sn) return null;
+
+    return {
+      title: sn.title || null,
+      channel: sn.channelTitle || null,
+      description: sn.description || "",
+      tags: Array.isArray(sn.tags) ? sn.tags.slice(0, 15) : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function summarizeYouTubeVideo(videoId) {
-  const [segments, meta] = await Promise.all([
-    fetchTranscript(videoId),
-    fetchYouTubeOEmbed(videoId),
-  ]);
-  const transcript = segments
-    .map((s) => s.text)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const meta = await fetchYouTubeOEmbed(videoId);
 
-  if (!transcript) throw new Error("empty transcript");
+  let transcript = "";
+  let captionError = null;
+  try {
+    const segments = await fetchTranscript(videoId);
+    transcript = segments
+      .map((s) => s.text)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  } catch (err) {
+    // Log the library's own error class — that's what tells you whether
+    // YouTube refused the request or the video really has no captions.
+    captionError = `${err?.name || "Error"}: ${err?.message || err}`;
+    console.error(`transcript fetch failed for ${videoId} —`, captionError);
+  }
 
-  return {
-    found: true,
-    type: "youtube_video",
-    title: meta?.title || null,
-    channel: meta?.author || null,
-    transcript: transcript.slice(0, SUMMARIZE_TEXT_LIMIT),
-  };
+  if (transcript) {
+    return {
+      found: true,
+      type: "youtube_video",
+      source: "captions",
+      title: meta?.title || null,
+      channel: meta?.author || null,
+      transcript: transcript.slice(0, SUMMARIZE_TEXT_LIMIT),
+    };
+  }
+
+  const details = await fetchVideoDetails(videoId);
+  const description = details?.description?.trim();
+  if (description) {
+    console.error(
+      `falling back to the description for ${videoId} (no captions retrieved)`
+    );
+    return {
+      found: true,
+      type: "youtube_video",
+      source: "description",
+      title: details.title || meta?.title || null,
+      channel: details.channel || meta?.author || null,
+      tags: details.tags,
+      description: description.slice(0, SUMMARIZE_TEXT_LIMIT),
+    };
+  }
+
+  throw new Error(captionError || "no captions and no description available");
 }
 
 async function summarizeWebpage(url) {
@@ -613,11 +676,14 @@ app.post("/api/chat", async (req, res) => {
             const result = await summarizeLink(args.url || "");
             resultText = JSON.stringify(result);
           } catch (err) {
-            console.error("summarize_link error:", err.message);
+            console.error(
+              "summarize_link error:",
+              `${err?.name || "Error"}: ${err?.message || err}`
+            );
             resultText = JSON.stringify({
               found: false,
               error:
-                "Could not read that link — it may have no captions/be private (YouTube), or the page blocked fetching or has no article text.",
+                "Could not read that link. The fetch failed — this is often the site or YouTube refusing the request from the server, not proof that the content is missing. Say the link couldn't be read right now and offer to work from pasted text.",
             });
           }
         } else {
