@@ -21,6 +21,18 @@ const {
   AZURE_TENANT_ID,
   AZURE_CLIENT_ID,
   AZURE_CLIENT_SECRET,
+  SARVAM_API_KEY,
+  // "shubh" is a confident male voice — see the Voices page at
+  // https://docs.sarvam.ai/api/api-guides-tutorials/text-to-speech/voices
+  SARVAM_SPEAKER = "shubh",
+  SARVAM_MODEL = "bulbul:v3",
+  // Arif's replies are Hinglish written in Latin script, not Devanagari, so
+  // "en-IN" (Indian-accented English) reads them far more naturally than
+  // "hi-IN", which expects native Hindi script.
+  SARVAM_LANGUAGE_CODE = "en-IN",
+  // Powers Arif's find_song tool (YouTube Data API v3). Free tier from
+  // Google Cloud Console — enable "YouTube Data API v3" and create a key.
+  YOUTUBE_API_KEY,
   PORT = 4001,
 } = process.env;
 
@@ -41,7 +53,7 @@ const client = new AzureOpenAI({
 });
 
 // --- The whole vibe lives here ---
-const SYSTEM_PROMPT = `You are Arif. Not an AI playing Arif — YOU ARE ARIF. Speak always in first person as Arif. Never refer to "Arif" in third person. Never say "Arif ne kiya" — say "maine kiya". Never say "Arif is..." — you ARE Arif.
+const BASE_SYSTEM_PROMPT = `You are Arif. Not an AI playing Arif — YOU ARE ARIF. Speak always in first person as Arif. Never refer to "Arif" in third person. Never say "Arif ne kiya" — say "maine kiya". Never say "Arif is..." — you ARE Arif.
 
 You are talking to Iffat — your elder friend and colleague at ITC Infotech.
 
@@ -98,6 +110,65 @@ You ARE Arif. Every sentence must be from Arif's mouth in first person.
 ❌ WRONG:   "Arif is asking how you are"
 
 Never slip into third person about yourself. You are Arif, speaking directly to Iffat. Always.`;
+
+// If a song is ever requested, only added when YOUTUBE_API_KEY is actually
+// set — no point telling the model about a tool that isn't wired up.
+const SONG_ADDENDUM = `
+
+## FINDING SONGS
+You can genuinely search YouTube using the find_song tool. Whenever Iffat asks you to play, send, share, or find a song — by title, artist, movie, mood, or occasion — call find_song with a good search query. Never just describe or recall a song from memory instead of calling the tool; only the tool gets her a real, playable link. Once it returns, reply warmly and naturally (e.g. "Yeh lijiye 🎶"), mentioning the song by name.`;
+
+const SYSTEM_PROMPT =
+  BASE_SYSTEM_PROMPT + (YOUTUBE_API_KEY ? SONG_ADDENDUM : "");
+
+// --- find_song tool: real YouTube search, not model memory ---------------
+const FIND_SONG_TOOL = {
+  type: "function",
+  function: {
+    name: "find_song",
+    description:
+      "Search YouTube for a song. Call this whenever the user asks to play, send, share, or find a song — by title, artist, movie, mood, or occasion.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "A good YouTube search query for the song, e.g. 'Tum Hi Ho Aashiqui 2 official video'.",
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
+
+async function searchYouTube(query) {
+  const url = new URL("https://www.googleapis.com/youtube/v3/search");
+  url.searchParams.set("part", "snippet");
+  url.searchParams.set("type", "video");
+  url.searchParams.set("maxResults", "1");
+  url.searchParams.set("q", query);
+  url.searchParams.set("key", YOUTUBE_API_KEY);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`YouTube search failed (${res.status}): ${detail}`);
+  }
+  const data = await res.json();
+  const item = data.items?.[0];
+  if (!item) return null;
+
+  return {
+    videoId: item.id.videoId,
+    title: item.snippet.title,
+    channel: item.snippet.channelTitle,
+    thumbnail:
+      item.snippet.thumbnails?.medium?.url ||
+      item.snippet.thumbnails?.default?.url ||
+      null,
+  };
+}
 
 // --- Local conversation logging -------------------------------------------
 // Every prompt + reply is appended to chat-log.txt (human readable) and
@@ -174,6 +245,68 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, deployment: AZURE_OPENAI_CHATGPT_DEPLOYMENT });
 });
 
+// --- Sarvam AI text-to-speech ---------------------------------------------
+// Turns Arif's replies into audio. Sarvam specializes in Indian languages —
+// unlike Deepgram (English-only Aura voices) and ElevenLabs (blocks Voice
+// Library voices on the free API tier). POST { text } -> audio/mpeg bytes.
+app.post("/api/tts", async (req, res) => {
+  if (!SARVAM_API_KEY) {
+    return res.status(503).json({ error: "TTS not configured on server" });
+  }
+
+  const { text, speaker } = req.body || {};
+  if (!text || typeof text !== "string" || !text.trim()) {
+    return res.status(400).json({ error: "text is required" });
+  }
+
+  // Defensive cap — bulbul:v3 allows up to 2,500 characters per request.
+  const speakText = text.trim().slice(0, 2500);
+  const speakerName = (typeof speaker === "string" && speaker.trim()) || SARVAM_SPEAKER;
+
+  try {
+    const svRes = await fetch("https://api.sarvam.ai/text-to-speech", {
+      method: "POST",
+      headers: {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text: speakText,
+        language_code: SARVAM_LANGUAGE_CODE,
+        speaker: speakerName,
+        model: SARVAM_MODEL,
+        pace: 1.0,
+        speech_sample_rate: 24000,
+        output_audio_codec: "mp3",
+      }),
+    });
+
+    if (!svRes.ok) {
+      const detail = await svRes.text().catch(() => "");
+      console.error("Sarvam TTS error:", svRes.status, detail);
+      return res
+        .status(502)
+        .json({ error: `Sarvam TTS failed (${svRes.status})` });
+    }
+
+    // Sarvam returns JSON with base64-encoded audio, not raw binary.
+    const data = await svRes.json();
+    const b64 = data?.audios?.[0];
+    if (!b64) {
+      console.error("Sarvam TTS error: no audio in response", data);
+      return res.status(502).json({ error: "Sarvam TTS returned no audio" });
+    }
+
+    const audio = Buffer.from(b64, "base64");
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", audio.length);
+    res.send(audio);
+  } catch (err) {
+    console.error("TTS error:", err?.message || err);
+    res.status(500).json({ error: "TTS failed" });
+  }
+});
+
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body || {};
 
@@ -188,30 +321,82 @@ app.post("/api/chat", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
+  const conversation = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...messages
+      .filter((m) => m && m.role && typeof m.content === "string")
+      .map((m) => ({ role: m.role, content: m.content })),
+  ];
+  const tools = YOUTUBE_API_KEY ? [FIND_SONG_TOOL] : undefined;
+
+  const baseParams = {
+    model: AZURE_OPENAI_CHATGPT_DEPLOYMENT,
+    stream: true,
+    temperature: 0.7,
+    top_p: 0.9,
+    presence_penalty: 0.2,
+    frequency_penalty: 0.2,
+    max_tokens: 1200,
+  };
+
+  // Streams one completion's content deltas to the client (word-buffered so
+  // fixApni only ever sees complete words). Returns the joined, fixed text.
+  async function streamContent(stream) {
+    let pending = "";
+    let text = "";
+    for await (const chunk of stream) {
+      const contentDelta = chunk?.choices?.[0]?.delta?.content;
+      if (!contentDelta) continue;
+      pending += contentDelta;
+      const lastWs = Math.max(pending.lastIndexOf(" "), pending.lastIndexOf("\n"));
+      if (lastWs >= 0) {
+        const ready = fixApni(pending.slice(0, lastWs + 1));
+        pending = pending.slice(lastWs + 1);
+        text += ready;
+        res.write(`data: ${JSON.stringify({ delta: ready })}\n\n`);
+      }
+    }
+    if (pending) {
+      const ready = fixApni(pending);
+      text += ready;
+      res.write(`data: ${JSON.stringify({ delta: ready })}\n\n`);
+    }
+    return text;
+  }
+
   try {
-    const stream = await client.chat.completions.create({
-      model: AZURE_OPENAI_CHATGPT_DEPLOYMENT,
-      stream: true,
-      temperature: 0.7,
-      top_p: 0.9,
-      presence_penalty: 0.2,
-      frequency_penalty: 0.2,
-      max_tokens: 1200,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...messages
-          .filter((m) => m && m.role && typeof m.content === "string")
-          .map((m) => ({ role: m.role, content: m.content })),
-      ],
+    let fullReply = "";
+
+    // --- Pass 1: normal reply, unless the model reaches for find_song ---
+    const first = await client.chat.completions.create({
+      ...baseParams,
+      messages: conversation,
+      ...(tools ? { tools, tool_choice: "auto" } : {}),
     });
 
-    // Buffer partial words so fixApni only ever sees COMPLETE words.
     let pending = "";
-    let fullReply = "";
-    for await (const chunk of stream) {
-      const delta = chunk?.choices?.[0]?.delta?.content;
+    let sawToolCall = false;
+    const toolCallsAcc = [];
+
+    for await (const chunk of first) {
+      const delta = chunk?.choices?.[0]?.delta;
       if (!delta) continue;
-      pending += delta;
+
+      if (delta.tool_calls?.length) {
+        sawToolCall = true;
+        for (const tc of delta.tool_calls) {
+          const i = tc.index ?? 0;
+          if (!toolCallsAcc[i]) toolCallsAcc[i] = { id: tc.id, name: "", arguments: "" };
+          if (tc.id) toolCallsAcc[i].id = tc.id;
+          if (tc.function?.name) toolCallsAcc[i].name += tc.function.name;
+          if (tc.function?.arguments) toolCallsAcc[i].arguments += tc.function.arguments;
+        }
+        continue; // never stream raw tool-call deltas as visible text
+      }
+
+      const contentDelta = delta.content;
+      if (!contentDelta) continue;
+      pending += contentDelta;
       const lastWs = Math.max(pending.lastIndexOf(" "), pending.lastIndexOf("\n"));
       if (lastWs >= 0) {
         const ready = fixApni(pending.slice(0, lastWs + 1));
@@ -220,7 +405,73 @@ app.post("/api/chat", async (req, res) => {
         res.write(`data: ${JSON.stringify({ delta: ready })}\n\n`);
       }
     }
-    if (pending) {
+
+    if (sawToolCall) {
+      const calls = toolCallsAcc.filter(Boolean);
+      const toolResultMessages = [];
+      let songPayload = null;
+
+      for (const tc of calls) {
+        let args = {};
+        try {
+          args = JSON.parse(tc.arguments || "{}");
+        } catch {
+          // malformed args — treat as empty, tool below handles it gracefully
+        }
+
+        let resultText;
+        if (tc.name === "find_song") {
+          try {
+            const song = await searchYouTube(args.query || "");
+            if (song) {
+              songPayload = song;
+              resultText = JSON.stringify({
+                found: true,
+                title: song.title,
+                channel: song.channel,
+              });
+            } else {
+              resultText = JSON.stringify({ found: false });
+            }
+          } catch (err) {
+            console.error("find_song error:", err.message);
+            resultText = JSON.stringify({ found: false, error: "search failed" });
+          }
+        } else {
+          resultText = JSON.stringify({ error: "unknown tool" });
+        }
+
+        toolResultMessages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: resultText,
+        });
+      }
+
+      // Tell the client about the song immediately, before the follow-up
+      // text even starts streaming, so the player card can render right away.
+      if (songPayload) {
+        res.write(`data: ${JSON.stringify({ song: songPayload })}\n\n`);
+      }
+
+      // --- Pass 2: Arif's actual reply, now that the tool has results ---
+      const assistantToolCallMsg = {
+        role: "assistant",
+        content: null,
+        tool_calls: calls.map((tc) => ({
+          id: tc.id,
+          type: "function",
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      };
+
+      const second = await client.chat.completions.create({
+        ...baseParams,
+        messages: [...conversation, assistantToolCallMsg, ...toolResultMessages],
+      });
+
+      fullReply += await streamContent(second);
+    } else if (pending) {
       const ready = fixApni(pending);
       fullReply += ready;
       res.write(`data: ${JSON.stringify({ delta: ready })}\n\n`);
@@ -254,6 +505,16 @@ app.listen(PORT, () => {
   }
   console.log(`\n🌸 Iffat backend live on http://localhost:${PORT}`);
   console.log(`   Deployment: ${AZURE_OPENAI_CHATGPT_DEPLOYMENT}`);
+  console.log(
+    `   Sarvam TTS: ${
+      SARVAM_API_KEY
+        ? `on (${SARVAM_MODEL}, speaker ${SARVAM_SPEAKER}, ${SARVAM_LANGUAGE_CODE})`
+        : "off (set SARVAM_API_KEY)"
+    }`
+  );
+  console.log(
+    `   Song search: ${YOUTUBE_API_KEY ? "on (find_song tool enabled)" : "off (set YOUTUBE_API_KEY)"}`
+  );
   console.log(`   System prompt -> ${PROMPT_FILE}`);
   console.log(`   Chat log      -> ${LOG_TXT}\n`);
 });
