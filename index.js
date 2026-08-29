@@ -9,6 +9,9 @@ import {
   ClientSecretCredential,
   getBearerTokenProvider,
 } from "@azure/identity";
+import { fetchTranscript } from "youtube-transcript-plus";
+import { Readability } from "@mozilla/readability";
+import { JSDOM } from "jsdom";
 
 // Load .env from THIS folder, regardless of the current working directory.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -118,8 +121,16 @@ const SONG_ADDENDUM = `
 ## FINDING SONGS
 You can genuinely search YouTube using the find_song tool. Whenever Iffat asks you to play, send, share, or find a song — by title, artist, movie, mood, or occasion — call find_song with a good search query. Never just describe or recall a song from memory instead of calling the tool; only the tool gets her a real, playable link. Once it returns, reply warmly and naturally (e.g. "Yeh lijiye 🎶"), mentioning the song by name.`;
 
+// Always on — summarize_link needs no API key at all.
+const SUMMARIZE_ADDENDUM = `
+
+## SUMMARIZING VIDEOS AND WEBPAGES
+You can genuinely read YouTube videos (via their captions) and webpages (via their article text) using the summarize_link tool. Whenever Iffat shares a YouTube link or any web URL and asks for a summary, or asks what it's about, call summarize_link with that URL first — never guess from the link alone or from memory. Once it returns, give her a clear, genuinely useful summary in your own warm voice — a few key points usually beats one giant paragraph. If it comes back with an error (no captions available, page couldn't be read), tell her honestly and suggest she paste the key parts instead.`;
+
 const SYSTEM_PROMPT =
-  BASE_SYSTEM_PROMPT + (YOUTUBE_API_KEY ? SONG_ADDENDUM : "");
+  BASE_SYSTEM_PROMPT +
+  SUMMARIZE_ADDENDUM +
+  (YOUTUBE_API_KEY ? SONG_ADDENDUM : "");
 
 // --- find_song tool: real YouTube search, not model memory ---------------
 const FIND_SONG_TOOL = {
@@ -168,6 +179,125 @@ async function searchYouTube(query) {
       item.snippet.thumbnails?.default?.url ||
       null,
   };
+}
+
+// --- summarize_link tool: real transcripts/article text, not model memory -
+// Needs no API key at all — captions come from YouTube's own player data,
+// and article text comes from Readability (the engine behind Firefox's
+// Reader View) run over the page's own HTML.
+const SUMMARIZE_LINK_TOOL = {
+  type: "function",
+  function: {
+    name: "summarize_link",
+    description:
+      "Fetch and read a YouTube video (via its captions) or any webpage (via its article text) so it can be summarized. Call this whenever the user shares a YouTube link or a web URL and asks for a summary, or asks what a video/article/page is about.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "The YouTube video URL or webpage URL to fetch and read.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+};
+
+// Cap how much extracted text we feed back to the model — plenty for a good
+// summary without blowing up the follow-up request.
+const SUMMARIZE_TEXT_LIMIT = 12000;
+
+function normalizeUrl(raw) {
+  if (!raw) return raw;
+  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+}
+
+function extractYouTubeId(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\.|^m\./, "");
+    if (host === "youtu.be") return u.pathname.slice(1).split("/")[0] || null;
+    if (host === "youtube.com" || host === "music.youtube.com") {
+      if (u.pathname === "/watch") return u.searchParams.get("v");
+      const shorts = u.pathname.match(/^\/shorts\/([^/]+)/);
+      if (shorts) return shorts[1];
+      const embed = u.pathname.match(/^\/embed\/([^/]+)/);
+      if (embed) return embed[1];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// No API key needed — YouTube's oEmbed endpoint is public.
+async function fetchYouTubeOEmbed(videoId) {
+  try {
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    return { title: data.title, author: data.author_name };
+  } catch {
+    return null;
+  }
+}
+
+async function summarizeYouTubeVideo(videoId) {
+  const [segments, meta] = await Promise.all([
+    fetchTranscript(videoId),
+    fetchYouTubeOEmbed(videoId),
+  ]);
+  const transcript = segments
+    .map((s) => s.text)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!transcript) throw new Error("empty transcript");
+
+  return {
+    found: true,
+    type: "youtube_video",
+    title: meta?.title || null,
+    channel: meta?.author || null,
+    transcript: transcript.slice(0, SUMMARIZE_TEXT_LIMIT),
+  };
+}
+
+async function summarizeWebpage(url) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    },
+    signal: AbortSignal.timeout(12000),
+  });
+  if (!res.ok) throw new Error(`page responded ${res.status}`);
+
+  const html = await res.text();
+  const dom = new JSDOM(html, { url });
+  const article = new Readability(dom.window.document).parse();
+  const text = article?.textContent?.replace(/\s+/g, " ").trim();
+  if (!text) throw new Error("could not extract readable content");
+
+  return {
+    found: true,
+    type: "webpage",
+    title: article.title || null,
+    siteName: article.siteName || null,
+    text: text.slice(0, SUMMARIZE_TEXT_LIMIT),
+  };
+}
+
+async function summarizeLink(rawUrl) {
+  const url = normalizeUrl(rawUrl);
+  const videoId = extractYouTubeId(url);
+  return videoId ? summarizeYouTubeVideo(videoId) : summarizeWebpage(url);
 }
 
 // --- Local conversation logging -------------------------------------------
@@ -327,7 +457,10 @@ app.post("/api/chat", async (req, res) => {
       .filter((m) => m && m.role && typeof m.content === "string")
       .map((m) => ({ role: m.role, content: m.content })),
   ];
-  const tools = YOUTUBE_API_KEY ? [FIND_SONG_TOOL] : undefined;
+  const tools = [
+    SUMMARIZE_LINK_TOOL,
+    ...(YOUTUBE_API_KEY ? [FIND_SONG_TOOL] : []),
+  ];
 
   const baseParams = {
     model: AZURE_OPENAI_CHATGPT_DEPLOYMENT,
@@ -436,6 +569,18 @@ app.post("/api/chat", async (req, res) => {
           } catch (err) {
             console.error("find_song error:", err.message);
             resultText = JSON.stringify({ found: false, error: "search failed" });
+          }
+        } else if (tc.name === "summarize_link") {
+          try {
+            const result = await summarizeLink(args.url || "");
+            resultText = JSON.stringify(result);
+          } catch (err) {
+            console.error("summarize_link error:", err.message);
+            resultText = JSON.stringify({
+              found: false,
+              error:
+                "Could not read that link — it may have no captions/be private (YouTube), or the page blocked fetching or has no article text.",
+            });
           }
         } else {
           resultText = JSON.stringify({ error: "unknown tool" });

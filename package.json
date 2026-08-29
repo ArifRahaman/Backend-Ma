@@ -13,9 +13,12 @@
   },
   "dependencies": {
     "@azure/identity": "^4.5.0",
+    "@mozilla/readability": "^0.5.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "openai": "^4.77.0"
+    "jsdom": "^25.0.1",
+    "openai": "^4.77.0",
+    "youtube-transcript-plus": "^2.0.0"
   }
 }
